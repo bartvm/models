@@ -26,12 +26,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import operator
 import os
 import time
 
 # pylint: disable=g-bad-import-order
 from absl import app as absl_app
 from absl import flags
+import numpy as np
 import tensorflow as tf
 # pylint: enable=g-bad-import-order
 
@@ -55,6 +57,37 @@ def compute_accuracy(logits, labels):
   batch_size = int(logits.shape[0])
   return tf.reduce_sum(
       tf.cast(tf.equal(predictions, labels), dtype=tf.float32)) / batch_size
+
+
+def _size(variable):
+  return reduce(operator.mul, (dim.value for dim in variable.shape))
+
+
+def save_gradients(model, epoch, model_dir, data_dir):
+  # Calculate number of parameters
+  num_params = sum(_size(variable) for variable in model.variables)
+  num_inputs = 600
+
+  # Memory mapped file to store gradients in
+  filename = os.path.join(model_dir, 'gradients_{}.dat'.format(epoch))
+  gradients = np.memmap(filename=filename, dtype=np.float32, mode='w+',
+                        shape=(num_inputs, num_params))
+
+  with tf.device('/cpu:0'):
+    train_ds = mnist_dataset.train(data_dir).batch(1)
+  for i, (image, label) in enumerate(train_ds):
+    with tf.GradientTape() as tape:
+      logit = model(image, training=False)
+      loss_value = loss(logit, label)
+    grads = tape.gradient(loss_value, model.variables)
+    j = 0
+    for grad in grads:
+      s = _size(grad)
+      gradients[i, j:j + s] = tf.reshape(grad, [-1])
+      j += s
+    assert j == num_params
+  assert i + 1 == num_inputs
+
 
 
 def train(model, optimizer, dataset, step_counter, log_interval=None):
@@ -153,7 +186,10 @@ def run_mnist_eager(flags_obj):
 
   # Train and evaluate for a set number of epochs.
   with tf.device(device):
-    for _ in range(flags_obj.train_epochs):
+    for epoch in range(flags_obj.train_epochs):
+      print('Dumping gradient matrix to {}'.format(flags_obj.model_dir))
+      if epoch == flags_obj.save_gradients_epoch:
+        save_gradients(model, epoch, flags_obj.model_dir, flags_obj.data_dir)
       start = time.time()
       with summary_writer.as_default():
         train(model, optimizer, train_ds, step_counter,
@@ -177,6 +213,10 @@ def define_mnist_eager_flags():
   flags.DEFINE_integer(
       name='log_interval', short_name='li', default=10,
       help=flags_core.help_wrap('batches between logging training status'))
+
+  flags.DEFINE_integer(
+      name='save_gradients_epoch', default=-1,
+      help=flags_core.help_wrap('before which epoch to dump gradients'))
 
   flags.DEFINE_string(
       name='output_dir', short_name='od', default=None,
